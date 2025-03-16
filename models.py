@@ -10,7 +10,7 @@ class MuZeroNetwork:
             return MuZeroFullyConnectedNetwork(
                 config.observation_shape,
                 config.stacked_observations,
-                len(config.action_space),
+                config.action_space,
                 config.encoding_size,
                 config.fc_reward_layers,
                 config.fc_value_layers,
@@ -97,11 +97,7 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
 
         self.representation_network = torch.nn.DataParallel(
             mlp(
-                observation_shape[0]
-                * observation_shape[1]
-                * observation_shape[2]
-                * (stacked_observations + 1)
-                + stacked_observations * observation_shape[1] * observation_shape[2],
+                observation_shape,
                 fc_representation_layers,
                 encoding_size,
             )
@@ -122,7 +118,7 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
             mlp(encoding_size, fc_policy_layers, self.action_space_size)
         )
         self.prediction_value_network = torch.nn.DataParallel(
-            mlp(encoding_size, fc_value_layers, self.full_support_size)
+            mlp(encoding_size, fc_value_layers, 1)
         )
 
     def prediction(self, encoded_state):
@@ -131,9 +127,7 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         return policy_logits, value
 
     def representation(self, observation):
-        encoded_state = self.representation_network(
-            observation.view(observation.shape[0], -1)
-        )
+        encoded_state = self.representation_network(observation)
         # Scale encoded state between [0, 1] (See appendix paper Training)
         min_encoded_state = encoded_state.min(1, keepdim=True)[0]
         max_encoded_state = encoded_state.max(1, keepdim=True)[0]
@@ -153,6 +147,7 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         )
         action_one_hot.scatter_(1, action.long(), 1.0)
         x = torch.cat((encoded_state, action_one_hot), dim=1)
+        # x = torch.cat((encoded_state, action), dim=1)
 
         next_encoded_state = self.dynamics_encoded_state_network(x)
 
@@ -170,21 +165,23 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         return next_encoded_state_normalized, reward
 
     def initial_inference(self, observation):
+        batch_size = observation.size(0)
         encoded_state = self.representation(observation)
         policy_logits, value = self.prediction(encoded_state)
         # reward equal to 0 for consistency
-        reward = torch.log(
-            (
-                torch.zeros(1, self.full_support_size)
-                .scatter(1, torch.tensor([[self.full_support_size // 2]]).long(), 1.0)
-                .repeat(len(observation), 1)
-                .to(observation.device)
-            )
-        )
+        # reward = torch.log(
+        #     (
+        #         torch.zeros(1, self.full_support_size)
+        #         .scatter(1, torch.tensor([[self.full_support_size // 2]]).long(), 1.0)
+        #         .repeat(len(observation), 1)
+        #         .to(observation.device)
+        #     )
+        # )
 
         return (
             value,
-            reward,
+            [0.0 for _ in range(batch_size)],
+            # reward,
             policy_logits,
             encoded_state,
         )

@@ -1,11 +1,16 @@
 import math
 import time
+import random
+import pdb
+
 
 import numpy
 import ray
 import torch
+from torch.distributions import Normal, Independent
 
 import models
+import utils
 
 
 @ray.remote
@@ -16,7 +21,8 @@ class SelfPlay:
 
     def __init__(self, initial_checkpoint, Game, config, seed):
         self.config = config
-        self.game = Game(seed)
+        # self.game = Game(seed)
+        self.game = Game
 
         # Fix random generator seed
         numpy.random.seed(seed)
@@ -113,12 +119,14 @@ class SelfPlay:
         """
         Play one game with actions based on the Monte Carlo tree search at each moves.
         """
+        pdb.set_trace()
         game_history = GameHistory()
-        observation = self.game.reset()
+        time_step_0 = self.game.reset()
+        observation = utils.flat_observation(time_step_0.observation)
         game_history.action_history.append(0)
         game_history.observation_history.append(observation)
         game_history.reward_history.append(0)
-        game_history.to_play_history.append(self.game.to_play())
+        game_history.to_play_history.append(0)
 
         done = False
 
@@ -130,13 +138,12 @@ class SelfPlay:
                 not done and len(game_history.action_history) <= self.config.max_moves
             ):
                 assert (
-                    len(numpy.array(observation).shape) == 3
-                ), f"Observation should be 3 dimensionnal instead of {len(numpy.array(observation).shape)} dimensionnal. Got observation of shape: {numpy.array(observation).shape}"
-                assert (
-                    numpy.array(observation).shape == self.config.observation_shape
+                    # numpy.array(observation).shape == self.config.observation_shape
+                    observation.shape[0]
+                    == self.config.observation_shape
                 ), f"Observation should match the observation_shape defined in MuZeroConfig. Expected {self.config.observation_shape} but got {numpy.array(observation).shape}."
                 stacked_observations = game_history.get_stacked_observations(
-                    -1, self.config.stacked_observations, len(self.config.action_space)
+                    -1, self.config.stacked_observations, self.config.action_space
                 )
 
                 # Choose the action
@@ -144,16 +151,18 @@ class SelfPlay:
                     root, mcts_info = MCTS(self.config).run(
                         self.model,
                         stacked_observations,
-                        self.game.legal_actions(),
-                        self.game.to_play(),
+                        # self.game.legal_actions(),  # TODO: actions should sampled from \beta
+                        # self.game.to_play(),
                         True,
                     )
                     action = self.select_action(
                         root,
-                        temperature
-                        if not temperature_threshold
-                        or len(game_history.action_history) < temperature_threshold
-                        else 0,
+                        (
+                            temperature
+                            if not temperature_threshold
+                            or len(game_history.action_history) < temperature_threshold
+                            else 0
+                        ),
                     )
 
                     if render:
@@ -257,12 +266,30 @@ class MCTS:
     def __init__(self, config):
         self.config = config
 
+    def sample_actions(self, policy_logits):
+        """
+        Sample actions from the policy logits using the temperature beta.
+        """
+        (mu, sigma) = torch.tensor(
+            policy_logits[: self.config.action_space]
+        ), torch.tensor(policy_logits[-self.config.action_space :])
+        self.mu = mu
+        self.sigma = sigma
+        dist = Independent(Normal(mu, sigma), 1)
+        # print(dist.batch_shape, dist.event_shape)
+        sampled_actions_before_tanh = dist.sample(
+            torch.tensor([self.config.num_of_sampled_actions])
+        )
+        sampled_actions = torch.tanh(sampled_actions_before_tanh)
+
+        return sampled_actions
+
     def run(
         self,
         model,
         observation,
-        legal_actions,
-        to_play,
+        # legal_actions,
+        # to_play,
         add_exploration_noise,
         override_root_with=None,
     ):
@@ -289,23 +316,26 @@ class MCTS:
                 policy_logits,
                 hidden_state,
             ) = model.initial_inference(observation)
-            root_predicted_value = models.support_to_scalar(
-                root_predicted_value, self.config.support_size
-            ).item()
-            reward = models.support_to_scalar(reward, self.config.support_size).item()
-            assert (
-                legal_actions
-            ), f"Legal actions should not be an empty array. Got {legal_actions}."
-            assert set(legal_actions).issubset(
-                set(self.config.action_space)
-            ), "Legal actions should be a subset of the action space."
+            # root_predicted_value = models.support_to_scalar(
+            #     root_predicted_value, self.config.support_size
+            # ).item()
+            # reward = models.support_to_scalar(reward, self.config.support_size).item()
+            # assert (
+            #     legal_actions
+            # ), f"Legal actions should not be an empty array. Got {legal_actions}."
+            # assert set(legal_actions).issubset(
+            #     set(self.config.action_space)
+            # ), "Legal actions should be a subset of the action space."
             root.expand(
-                legal_actions,
-                to_play,
+                self.config,
+                # to_play,
                 reward,
                 policy_logits,
                 hidden_state,
             )
+            # TODO: Muzero expands the root node with all legal actions here,
+            # For Sampled Muzero, the legal actions should be sampled from the policy \beta
+            # and then according to variant PUCB, choose the argmax actions
 
         if add_exploration_noise:
             root.add_exploration_noise(
@@ -317,7 +347,7 @@ class MCTS:
 
         max_tree_depth = 0
         for _ in range(self.config.num_simulations):
-            virtual_to_play = to_play
+            # virtual_to_play = to_play
             node = root
             search_path = [node]
             current_tree_depth = 0
@@ -328,23 +358,23 @@ class MCTS:
                 search_path.append(node)
 
                 # Players play turn by turn
-                if virtual_to_play + 1 < len(self.config.players):
-                    virtual_to_play = self.config.players[virtual_to_play + 1]
-                else:
-                    virtual_to_play = self.config.players[0]
+                # if virtual_to_play + 1 < len(self.config.players):
+                #     virtual_to_play = self.config.players[virtual_to_play + 1]
+                # else:
+                #     virtual_to_play = self.config.players[0]
 
             # Inside the search tree we use the dynamics function to obtain the next hidden
             # state given an action and the previous hidden state
             parent = search_path[-2]
             value, reward, policy_logits, hidden_state = model.recurrent_inference(
                 parent.hidden_state,
-                torch.tensor([[action]]).to(parent.hidden_state.device),
+                action.to(parent.hidden_state.device),
             )
             value = models.support_to_scalar(value, self.config.support_size).item()
             reward = models.support_to_scalar(reward, self.config.support_size).item()
             node.expand(
-                self.config.action_space,
-                virtual_to_play,
+                self.config,
+                # virtual_to_play,
                 reward,
                 policy_logits,
                 hidden_state,
@@ -368,7 +398,14 @@ class MCTS:
             self.ucb_score(node, child, min_max_stats)
             for action, child in node.children.items()
         )
-        action = numpy.random.choice(
+        # action = numpy.random.choice(
+        #     [
+        #         action
+        #         for action, child in node.children.items()
+        #         if self.ucb_score(node, child, min_max_stats) == max_ucb
+        #     ]
+        # )
+        action = random.choice(
             [
                 action
                 for action, child in node.children.items()
@@ -389,7 +426,11 @@ class MCTS:
         )
         pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
 
-        prior_score = pb_c * child.prior
+        prior_score = pb_c * (
+            torch.exp(child.prior)
+            / (sum([torch.exp(node.prior) for node in parent.children.values()]) + 1e-6)
+        ).detach().item()
+        # prior_score = pb_c * child.prior
 
         if child.visit_count > 0:
             # Mean value Q
@@ -448,20 +489,45 @@ class Node:
             return 0
         return self.value_sum / self.visit_count
 
-    def expand(self, actions, to_play, reward, policy_logits, hidden_state):
+    def expand(self, config, reward, policy_logits, hidden_state):
         """
         We expand a node using the value, reward and policy prediction obtained from the
         neural network.
         """
-        self.to_play = to_play
+        # self.to_play = to_play
         self.reward = reward
         self.hidden_state = hidden_state
 
-        policy_values = torch.softmax(
-            torch.tensor([policy_logits[0][a] for a in actions]), dim=0
-        ).tolist()
-        policy = {a: policy_values[i] for i, a in enumerate(actions)}
-        for action, p in policy.items():
+        # Use the prediction function output to generate mu and sigma for each action space dimention
+        # (mu, sigma) = (
+        #     policy_logits[: config.action_space],
+        #     policy_logits[-config.action_space :],
+        # )
+        mu = policy_logits[0]
+
+        self.mu = mu
+        self.sigma = torch.ones_like(mu)
+        dist = Independent(Normal(self.mu, self.sigma), 1)
+
+        # Sample contious actions from each action space dimention normal distribution
+        sampled_actions_before_tanh = dist.sample(
+            torch.tensor([config.num_of_sampled_actions])
+        )
+
+        # Because the actions are sampled from a normal distribution, however, for
+        # walk task, the action value is in the range of [-1, 1], so we need to
+        # use tanh to normalize the actions to [-1, 1]
+        sampled_actions = torch.tanh(sampled_actions_before_tanh)
+
+        # To calculate the prior
+        y = 1 - sampled_actions.pow(2) + 1e-6
+        log_prob = dist.log_prob(sampled_actions_before_tanh).unsqueeze(-1)
+        log_prob = log_prob - torch.log(y).sum(-1, keepdim=True)
+        self.legal_actions = []
+
+        for action_index in range(config.num_of_sampled_actions):
+            action = sampled_actions[action_index]
+            p = log_prob[action_index]
             self.children[action] = Node(p)
 
     def add_exploration_noise(self, dirichlet_alpha, exploration_fraction):
@@ -499,9 +565,11 @@ class GameHistory:
             sum_visits = sum(child.visit_count for child in root.children.values())
             self.child_visits.append(
                 [
-                    root.children[a].visit_count / sum_visits
-                    if a in root.children
-                    else 0
+                    (
+                        root.children[a].visit_count / sum_visits
+                        if a in root.children
+                        else 0
+                    )
                     for a in action_space
                 ]
             )
@@ -520,7 +588,7 @@ class GameHistory:
         # Convert to positive index
         index = index % len(self.observation_history)
 
-        stacked_observations = self.observation_history[index].copy()
+        stacked_observations = self.observation_history[index].clone()
         for past_observation_index in reversed(
             range(index - num_stacked_observations, index)
         ):

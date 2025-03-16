@@ -11,6 +11,7 @@ import nevergrad
 import numpy
 import ray
 import torch
+from dm_control import suite
 from torch.utils.tensorboard import SummaryWriter
 
 import diagnose_model
@@ -19,6 +20,9 @@ import replay_buffer
 import self_play
 import shared_storage
 import trainer
+
+
+import pdb
 
 
 class MuZero:
@@ -43,8 +47,12 @@ class MuZero:
         # Load the game and the config from the module with the game name
         try:
             game_module = importlib.import_module("games." + game_name)
-            self.Game = game_module.Game
+            # self.Game = game_module.Game
             self.config = game_module.MuZeroConfig()
+
+            env = suite.load(domain_name="walker", task_name="walk")
+            self.Game = env
+            self.Game.task.random.seed(self.config.seed)
         except ModuleNotFoundError as err:
             print(
                 f'{game_name} is not a supported game name, try "cartpole" or refer to the documentation for adding a new game.'
@@ -93,7 +101,7 @@ class MuZero:
         if 1 < self.num_gpus:
             self.num_gpus = math.floor(self.num_gpus)
 
-        ray.init(num_gpus=total_gpus, ignore_reinit_error=True)
+        ray.init(num_gpus=total_gpus, ignore_reinit_error=True, local_mode=True)
 
         # Checkpoint and replay buffer used to initialize workers
         self.checkpoint = {
@@ -471,8 +479,8 @@ class MuZero:
         Args:
             horizon (int): Number of timesteps for which we collect information.
         """
-        game = self.Game(self.config.seed)
-        obs = game.reset()
+        game = self.Game.task.random.seed(self.config.seed)
+        obs = game.reset().observation
         dm = diagnose_model.DiagnoseModel(self.checkpoint, self.config)
         dm.compare_virtual_with_real_trajectories(obs, game, horizon)
         input("Press enter to close all plots")

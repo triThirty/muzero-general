@@ -95,7 +95,6 @@ joblib==1.1.0
     # via scikit-learn
 jsonschema==4.2.1
     # via ray
-kiwisolver==1.3.2
     # via matplotlib
 markdown==3.3.6
     # via tensorboard
